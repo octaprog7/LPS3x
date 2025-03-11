@@ -1,0 +1,29 @@
+# LPS3x
+Модуль MicroPython для работы с датчиком давления окружающего воздуха LPS3x от STMicroelectronics
+
+# Мотивация
+Из-за доминирования в моих репозиториях датчиков давления воздуха фирмы на букву "Б", 
+я принял решение "разбавить" его (доминирование) датчиком другого производителя. 
+В данном случае это STMicroelectronics.
+
+# Подключение
+Просто подключите плату c LPS3x к Arduino, ESP или любой другой плате с прошивкой MicroPython.
+
+# Питание
+Напряжение питания LPS3x 1,7..3,6 Вольта!
+1. VCC
+2. GND
+3. SDA
+4. SCL
+
+# Прошивка
+Загрузите прошивку MicroPython на плату NANO, PICO RP2040 (ESP и т. д.), а затем файлы: main.py, lps3xmod.py и папку sensor_pack_2 полностью. 
+Затем откройте main.py в своей IDE и запустите его.
+
+# Картинки
+
+## Среда разработки
+![alt text](https://github.com/octaprog7/LPS3x/blob/master/pics/ide_0.png)
+## Железо
+![alt text](https://github.com/octaprog7/LPS3x/blob/master/pics/board_0.png)
+
