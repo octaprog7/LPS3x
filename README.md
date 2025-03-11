@@ -27,3 +27,6 @@ Then open main.py in your IDE and run it.
 ## Board
 ![alt text](https://github.com/octaprog7/LPS3x/blob/master/pics/board_0.png)
 
+# Warning
+It seems that the store with the letter "A" deceived me. The sensor on the board does not look like LPS3x. LPS3x has a CCLGA-4L case type. 
+I do not know what sensor is on the board!
