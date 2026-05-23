@@ -1,242 +1,185 @@
-from collections import namedtuple
+# micropython
+# mail: kolbasilyvasily@yandex.ru
+# MIT license
+import micropython
+from micropython import const
+from sensor_pack_2.base_sensor import DeviceEx, check_value, Iterator
+from sensor_pack_2.bmp_common import (IBaseAirPresSensor, SensorMode,
+                                      MeasuredParams, SensorID, OversamplingCoeff)
 
-from sensor_pack_2 import bus_service
-from sensor_pack_2.base_sensor import IDentifier, IBaseSensorEx, DeviceEx, Iterator, check_value
-from sensor_pack_2.bitfield import bit_field_info
-from sensor_pack_2.bitfield import BitFields
+#  Регистры LPS33K
+_REG_WHO_AM_I = const(0x0F)
+_REG_CTRL_REG1 = const(0x10)
+_REG_CTRL_REG2 = const(0x11)
+_REG_STATUS = const(0x27)
+_REG_PRESS_OUT = const(0x28)  # 0x28(XL), 0x29(L), 0x2A(H)
+_REG_TEMP_OUT = const(0x2B)  # 0x2B(L), 0x2C(H)
 
-# serial_number_sht4x = namedtuple("serial_number_sht4x", "word_0 word_1")
-# measured_values_sht4x = namedtuple("measured_values_sht4x", "T RH")
-# Low-pass configuration
-LPFP_config = namedtuple("LPFP_config", "enabled config")
-# содержимое регистра состояние датчика
-# TempOverrun - Temperature data overrun
-# PressureOverrun - Pressure data overrun
-# TempAvailable - Temperature data available
-# PressAvailable - Pressure data available
-lps3x_status = namedtuple("lps3x_status", "TempOverrun PressureOverrun TempAvailable PressAvailable")
-lps3x_measured_values = namedtuple("lps3x_measured_values", "pressure temperature pressure_offset")
+#  Постоянные
+_WHO_AM_I_VAL = const(0xB1)
+_SENS_PRESS = const(4096)  # LSB/hPa
+_SENS_TEMP = const(100)  # LSB/°C
+_HPA_TO_PA = const(100)
+_ODR_HZ = (0, 1, 10, 25, 50, 75)
 
-class LPS3xST(IDentifier, IBaseSensorEx, Iterator):
-    """Класс для работы с MEMS датчиком давления от STMicroelectronics - LPS3x.
-    Class for work with STMicroelectronics LPS3x MEMS pressure sensor"""
+@micropython.native
+def _to_signed(raw: int, bits: int) -> int:
+    """Преобразует беззнаковое сырое значение в знаковое (дополнение до 2)."""
+    return raw - (1 << bits) if raw >= (1 << (bits - 1)) else raw
 
-    _ctrl_reg_1 =   (bit_field_info(name='ODR', position=range(4, 7), valid_values=range(6), description=None),    # Output data rate selection
-                    bit_field_info(name='EN_LPFP', position=range(3, 4), valid_values=None, description=None),  # Enable low-pass filter on pressure data
-                    bit_field_info(name='LPFP_CFG', position=range(2, 3), valid_values=range(6), description=None), # Low-pass configuration register
-                    # Бит BDU используется для запрета обновления выходных регистров между считыванием верхней и нижней частей регистра.
-                    # В режиме по умолчанию (BDU = ‘0’) нижняя и верхняя части регистра обновляются непрерывно. Когда BDU активирован (BDU = ‘1’),
-                    # содержимое выходных регистров не обновляется до тех пор, пока не будет считан PRESS_OUT_H (2Ah),
-                    # чтобы избежать считывания значений, относящихся к разным образцам. Должен быть всегда в "1"
-                    bit_field_info(name='BDU', position=range(1, 2), valid_values=None, description=None),  # Block data update
-                    )
-    _ctrl_reg_2 = (bit_field_info(name='BOOT', position=range(7, 8), valid_values=None, description=None),  # Reboot memory content
-                   # должен быть всегда в "1"
-                   bit_field_info(name='IF_ADD_INC', position=range(4, 5), valid_values=None, description=None), # Register address automatically incremented during a multiple byte access with a I²C
-                   bit_field_info(name='SWRESET', position=range(2, 3), valid_values=None, description=None),   # Software reset
-                   # Бит ONE_SHOT используется для начала нового преобразования, когда биты ODR[2:0] в CTRL_REG1 (10h) установлены в «000».
-                   # Запись «1» в ONE_SHOT запускает единичное измерение давления и температуры. После завершения измерения бит ONE_SHOT автоматически очищается,
-                   # новые данные становятся доступными в выходных регистрах, а биты STATUS (27h) обновляются.
-                   bit_field_info(name='ONE_SHOT', position=range(1), valid_values=None, description=None), # One-shot enable
-                   )
 
-    def __init__(self, adapter: bus_service.BusAdapter, address=0x5D):
-        """Если check_crc в Истина, то каждый, принятый от датчика пакет данных, проверяется на правильность путем
-        расчета контрольной суммы."""
-        check_value(address, range(0x5D, 0x5E), f"Неверный адрес устройства: {address}")
-        self._connector = DeviceEx(adapter=adapter, address=address, big_byte_order=False)
+class Lps33(IBaseAirPresSensor, Iterator):
+    """Модуль для управления LPS33K от ST, (300-1200 hPa).
+    Калибровка выполнена на заводе, коэффициенты не требуются."""
+
+
+    def __init__(self, adapter, address: int = 0x5D):
+        self._connection = DeviceEx(adapter=adapter, address=address, big_byte_order=False)
+        self._buf_5 = bytearray(5)  # burst-read: 3 байта P + 2 байта T
+        wr_reg = self._connection.write_reg
+        # инит: ODR=000(PD), BDU=1, IF_ADD_INC=1
+        wr_reg(_REG_CTRL_REG1, 0x04, 1)
+        wr_reg(_REG_CTRL_REG2, 0x10, 1)
         #
-        self._single_shot_mode = None
-        # self._continuously_mode = None
-        # Частота обновления данных, Гц. Output data rate, Hz. 0..5.
-        self._odr = None
-        # Enable low-pass filter on pressure data
-        self._lpfp_enabled = None
-        # Low-pass filter configurations, 0..3
-        self._lpfp_config = None
-        # Block data update. (0: continuous update; # 1: output registers not updated until MSB and LSB have been read)
-        self._bdu = None
+        self._mode = SensorMode.SLEEP
+        self._odr_raw = 0
+        self._odr_hz = 0
+
+    # == ЯДРО ИЗМЕРЕНИЙ ==
+    @micropython.native
+    def _read_raw_data(self) -> tuple[int, int]:
+        self._connection.read_buf_from_mem(_REG_PRESS_OUT, self._buf_5, 1)
+        raw_p = _to_signed(int.from_bytes(self._buf_5[0:3], 'little'), 24)
+        raw_t = _to_signed(int.from_bytes(self._buf_5[3:5], 'little'), 16)
+        return raw_p, raw_t
+
+    def get_temperature(self) -> float:
+        _, raw_t = self._read_raw_data()
+        return raw_t / _SENS_TEMP
+
+    def get_pressure(self) -> float:
+        raw_p, _ = self._read_raw_data()
+        return _HPA_TO_PA * (raw_p / _SENS_PRESS)
+
+    def is_data_ready(self) -> bool:
+        return bool(self._connection.read_reg(_REG_STATUS, 1)[0] & 0x03)
+
+    # == ИНТЕРФЕЙСНЫЕ МЕТОДЫ ==
+    def get_id(self) -> SensorID:
+        """Возвращает идентификатор датчика."""
+        return SensorID(chip_id=_WHO_AM_I_VAL, revision_id=None, spare1=None, spare2=None)
+
+    def soft_reset(self) -> None:
+        """Программный сброс датчика (SWRESET)."""
+        # SWRESET = бит 2 в CTRL_REG2 (0x11). Само-сбрасывается.
+        self._connection.write_reg(_REG_CTRL_REG2, 0x04, 1)
+        # sleep_ms(10)  # Ожидание завершения сброса и загрузки калибровки
+
+    def get_error(self) -> int:
+        """Возвращает флаги ошибок (переполнение данных P/T)."""
+        stat = self._connection.read_reg(_REG_STATUS, 1)[0]
+        # Бит 3: P_OR, Бит 4: T_OR -> сдвигаем в 0..1
+        return (stat >> 3) & 0x03
+
+    def get_data_status(self, raw: bool = True):
+        """Возвращает статус готовности и переполнения."""
+        stat = self._connection.read_reg(_REG_STATUS, 1)[0]
+        if raw:
+            return stat
+        return {
+            "press_ready": bool(stat & 0x01),
+            "temp_ready": bool(stat & 0x02),
+            "press_overrun": bool(stat & 0x08),
+            "temp_overrun": bool(stat & 0x10)
+        }
+
+    def __next__(self) -> MeasuredParams | None:
+        """Итератор: возвращает MeasuredParams в Normal mode."""
+        if not self.is_continuously_mode():
+            return None
+        if self.is_data_ready():
+            return MeasuredParams(
+                temperature=self.get_temperature(),
+                pressure=self.get_pressure()
+            )
+        return None
+
+    # == УПРАВЛЕНИЕ РЕЖИМАМИ ==
+    def set_power_mode(self, value: int | None = None) -> int:
+        """Устанавливает режим: 0=Sleep (Power Down), 1=Forced, 2=Normal(Continuous)."""
+        if value is None:
+            return self._mode
+
+        conn = self._connection
+
+        check_value(value, range(3), f"Invalid mode: {value}")
+        ctrl1 = conn.read_reg(_REG_CTRL_REG1, 1)[0]
+        ctrl1 &= ~0x70  # Очищаем биты ODR[2:0] (биты 6:4)
+
+        if SensorMode.SLEEP == value:  # SLEEP
+            ctrl1 |= 0x00
+            self._odr_hz = 0
+        elif SensorMode.NORMAL == value:  # NORMAL
+            # Использую кэшированный ODR. Если он 0, использую безопасное значение (25 Гц - индекс 3)
+            odr_to_set = self._odr_raw if self._odr_raw != 0 else 3
+            ctrl1 |= (odr_to_set << 4)
+            self._odr_raw = odr_to_set
+            self._odr_hz = _ODR_HZ[odr_to_set]
+
+        conn.write_reg(_REG_CTRL_REG1, ctrl1, 1)
+        self._mode = value
+        return value
+
+    def start_measurement(self):
+        """Запуск однократного измерения (One-shot). Работает только при ODR=000."""
+        if self._mode == SensorMode.NORMAL:
+            return  # В непрерывном режиме датчик мерит сам, вызов не нужен
         #
-        # для удобства работы с настройками
-        self._ctrl_reg_1_fields = BitFields(fields_info=LPS3xST._ctrl_reg_1)
-        self._ctrl_reg_2_fields = BitFields(fields_info=LPS3xST._ctrl_reg_2)
-        #
-        self._buf_2 = bytearray(2)
-        self._buf_3 = bytearray(3)
-        # установка значений полей экземпляра класса
-        self.raw_config_to_properties()
-        self._init_ctrl_reg_2()
+        conn = self._connection
+        # Forced mode требует ODR=000
+        ctrl1 = conn.read_reg(_REG_CTRL_REG1, 1)[0]
+        ctrl1 &= ~0x70
+        conn.write_reg(_REG_CTRL_REG1, ctrl1, 1)
 
-    def _read_buf_from_dev(self, addr: int, destination: bytearray) -> int:
-        """Считывает из памяти датчика, начиная с адреса addr len(destination) байт в буфер destination.
-        Возвращает длину буфера в байтах."""
-        _len = len(destination)
-        check_value(_len, range(2, 4), f"Неверная длина буфера [байт]: {_len}")
-        _buf = self._buf_3 if 3 == _len else self._buf_2
-        conn = self._connector
-        conn.read_buf_from_mem(address=addr, buf=_buf, address_size=1)
-        return _len
-
-    def _get_temperature(self) -> float:
-        """Возвращает температуру корпуса датчика в градусах Цельсия!"""
-        buf = self._buf_2
-        self._read_buf_from_dev(addr=0x2B, destination=buf)
-        t = self._connector.unpack(fmt_char="h", source=buf)
-        return 0.01 * t[0]
-
-    def _get_pressure(self, press_out: bool = True) -> [int, float]:
-        """Возвращает давление окружающего воздуха в hPa при press_out в Истина [float]!
-        Возвращает 24-битные данные давления, вычитаемые из выходного сигнала датчика, измерение в режиме
-        авто обнуления (auto-zero mode) при press_out в Ложь [int]!"""
-        buf = self._buf_3
-        offs = 0x28 if press_out else 0x15
-        self._read_buf_from_dev(addr=offs, destination=buf)
-        _p = buf[0] + (buf[1] << 8) + (buf[2] << 16)
-        if not press_out:
-            return _p
-        return 0.00024414062 * _p
-
-    def _read_reg_8bit(self, addr: int) -> int:
-        """Возвращает содержимое восьмибитного регистра устройства с адресом addr"""
-        return self._connector.read_reg(reg_addr=addr, bytes_count=1)[0]
-
-    def _write_reg_8bit(self, addr: int, value: int):
-        """Запиcывает в восьмибитный регистр устройства с адресом addr значение value"""
-        self._connector.write_reg(reg_addr=addr, value=value, bytes_count=1)
-
-    def _init_ctrl_reg_2(self, one_shot: bool = False, sw_reset: bool = False, default_value: int = 0x10):
-        """Записывает в биты ctrl_reg_2 значения по умолчанию.
-        Всегда включаю в 1 бит IF_ADD_INC!"""
-        _addr = 0x11
-        raw = self._read_reg_8bit(addr=_addr)
-        if one_shot:
-            raw |= 0x01
-        if sw_reset:
-            raw |= 0x04
-        self._write_reg_8bit(addr=_addr, value=raw | default_value)
-
-    @staticmethod
-    def _hz_from_odr(raw_odr: int) -> int:
-        """Возвращает частоту преобразования в Гц, соответствующую параметру raw_odr."""
-        check_value(raw_odr, range(6), f"Неверное значение параметра raw_odr: {raw_odr}")
-        _hz = 0, 1, 10, 25, 50, 75  # зависимость ODR в Гц от raw ODR.
-        return _hz[raw_odr]
-
-    def raw_config_to_properties(self):
-        """Преобразует содержимое регистра управления 1 в свойства экземпляра класса."""
-        bit_fields = self._ctrl_reg_1_fields
-        bit_fields.source = self._read_reg_8bit(0x10)
-        #
-        self._odr = bit_fields['ODR']
-        self._lpfp_enabled = bit_fields['EN_LPFP']
-        self._lpfp_config = bit_fields['LPFP_CFG']
-        self._bdu = bit_fields['BDU']
-
-    def properties_to_raw_config(self) -> int:
-        """Преобразует значения свойств экземпляра класса в число, которое должно быть записано в CTRL_REG1 (0x10)"""
-        _cfg = self._read_reg_8bit(addr=0x10)
-        bit_fields = self._ctrl_reg_1_fields
-        bit_fields.source = _cfg
-        #
-        bit_fields['ODR'] = self.get_output_data_rate()
-        bit_fields['EN_LPFP'] = self._lpfp_enabled
-        bit_fields['LPFP_CFG'] = self._lpfp_config
-        bit_fields['BDU'] = True    # 1: output registers not updated until MSB and LSB have been read)
-        #
-        return bit_fields.source
-
-    # IDentifier
-    def get_id(self) -> int:
-        """Возвращает ответ на команду 'WHO_AM_I'"""
-        return self._read_reg_8bit(0x0F)
-
-    def soft_reset(self):
-        """Програмный сброс устройства"""
-        addr = 0x11
-        raw = self._read_reg_8bit(addr)
-        self._write_reg_8bit(addr, raw | 0x04)
-
-    # IBaseSensorEx
-    def get_data_status(self) -> lps3x_status:
-        """Возвращает состояние готовности данных для считывания?"""
-        stat = self._read_reg_8bit(addr=0x27)
-        return lps3x_status(TempOverrun=bool(0x20 & stat), PressureOverrun=bool(0x10 & stat),
-                            TempAvailable=bool(0x02 & stat), PressAvailable=bool(0x01 & stat))
-
-    def get_measurement_value(self, value_index: [int] = 3) -> lps3x_measured_values:
-        """Возвращает измеренное датчиком значение(значения) по его индексу/номеру."""
-        if 1 == value_index:    # температура окружающего воздуха
-            return lps3x_measured_values(pressure=None, temperature=self._get_temperature(), pressure_offset=None)
-        if 2 == value_index:    # давление окружающего воздуха
-            return lps3x_measured_values(pressure=self._get_pressure(press_out=True), temperature=None, pressure_offset=None)
-        if 3 == value_index:    # давление и температура окружающего воздуха
-            _press = self._get_pressure(press_out=True)
-            _temp = self._get_temperature()
-            return lps3x_measured_values(pressure=_press, temperature=_temp, pressure_offset=None)
-        if 4 == value_index:    # pressure offset
-            return lps3x_measured_values(pressure=None, temperature=None, pressure_offset=self._get_pressure(press_out=False))
+        # Триггер ONE_SHOT (бит 0 в CTRL_REG2)
+        ctrl2 = conn.read_reg(_REG_CTRL_REG2, 1)[0]
+        conn.write_reg(_REG_CTRL_REG2, ctrl2 | 0x01, 1)
 
     def get_conversion_cycle_time(self) -> int:
-        """Возвращает время в мс преобразования сигнала в цифровой код и готовности его для чтения по шине!
-        Для текущих настроек датчика. При изменении настроек следует заново вызвать этот метод!"""
-        _odr = self.get_output_data_rate()
-        if 0 == _odr:
-            return 14 # [ms] 1/75  допустим(!) это минимальное время преобразования в однократном режиме (по запросу) измерения
-
-        return int(1_000/LPS3xST._hz_from_odr(_odr))  # время в [мс]!!!
-
-    def start_measurement(self, continuous_mode: bool = True, raw_odr: int = 1):
-        """Настраивает параметры датчика и запускает процесс измерения.
-        raw_odr - сырое значение output data rate 0..5, 0 - только для режима однократных измерений (измерение по запросу!). См. get_output_data_rate.
-        continuous_mode в Истина - режим автоматических периодических измерений с 'частотой' raw_odr.
-        continuous_mode в Ложь - режим измерений по запросу (однократные не периодические измерения)."""
-        if continuous_mode and 0 == raw_odr:
-            raise ValueError(f"В автоматическом режиме измерений значение raw_odr не должно быть равно нулю!")
-        if not continuous_mode and 0 != raw_odr:
-            raise ValueError(f"В режиме измерений по запросу значение raw_odr должно быть равно нулю!")
-        _raw_odr = raw_odr if continuous_mode else 0
-        self._odr = _raw_odr
-        raw_cfg_1 = self.properties_to_raw_config() # для записи в ctrl_reg_1
-        self._write_reg_8bit(addr=0x10, value=raw_cfg_1)
-        # для запись в ctrl_reg_2
-        self._init_ctrl_reg_2(not continuous_mode, sw_reset=False)
-        # обновляю значения полей в соответствии с настройками датчика
-        self.raw_config_to_properties()
-
+        """Возвращает время цикла в мс."""
+        if SensorMode.FORCED == self._mode:
+            return 20  # One-shot
+        if self._odr_hz > 0:
+            return int(1000 / self._odr_hz) + 10
+        return 40
 
     def is_single_shot_mode(self) -> bool:
-        """Возвращает Истина, когда датчик находится в режиме однократных измерений,
-        каждое из которых запускается методом start_measurement"""
-        return 0 == self.get_output_data_rate()
+        return SensorMode.FORCED == self._mode
 
     def is_continuously_mode(self) -> bool:
-        """Возвращает Истина, когда датчик находится в режиме многократных измерений,
-        производимых автоматически. Процесс запускается методом start_measurement"""
-        return not self.is_single_shot_mode()
+        return SensorMode.NORMAL == self._mode
 
-    def get_output_data_rate(self) -> int:
-        """Return raw(!) output data rate (0..5):
-        0 - Power down / one-shot mode enabled/0 Hz;
-        1 - 1 Hz;
-        2 - 10 Hz;
-        3 - 25 Hz;
-        4 - 50 Hz;
-        5 - 75 Hz;"""
-        return self._odr
+    # == ЗАГЛУШКИ ДЛЯ КОНТРАКТА ==
+    def set_oversampling(self, temp: int | None = None, press: int | None = None)-> None | OversamplingCoeff:
+        """LPS33K не поддерживает настройку oversampling. Возвращает фиксированные значения."""
+        return OversamplingCoeff(temperature=0, pressure=0)
 
-    def get_lpfp_config(self) -> LPFP_config:
-        """Возвращает Low-pass filter configurations."""
-        return LPFP_config(enabled=self._lpfp_enabled, config=self._lpfp_config)
+    def set_iir_filter(self, temp: int | None = None, press: int | None = None):
+        """LPS33K использует общий LPFP. Настройка через CTRL_REG1[3:2] опциональна."""
+        return 0, 0
 
-    # Iterator
-    def __next__(self) -> [lps3x_measured_values, None]:
-        if self.is_continuously_mode():
-            # режим непрерывного преобразования!
-            stat = self.get_data_status()
-            if stat.PressAvailable and stat.TempAvailable:
-                return self.get_measurement_value(3)
-            if stat.PressAvailable and not stat.TempAvailable:
-                return self.get_measurement_value(2)
-            if not stat.PressAvailable and stat.TempAvailable:
-                return self.get_measurement_value(1)
-        return None
+    def set_sampling_period(self, value: int | None = None) -> int:
+        """Устанавливает или возвращает индекс ODR (0..5).
+        0=Power Down, 1=1Hz, 2=10Hz, 3=25Hz, 4=50Hz, 5=75Hz."""
+        conn = self._connection
+        if value is not None:
+            check_value(value, range(6), f"Invalid ODR index: {value}")
+            self._odr_raw = value
+            self._odr_hz = _ODR_HZ[value]
+            ctrl1 = conn.read_reg(_REG_CTRL_REG1, 1)[0]
+            ctrl1 = (ctrl1 & ~0x70) | (value << 4)
+            conn.write_reg(_REG_CTRL_REG1, ctrl1, 1)
+
+        self._odr_raw = (conn.read_reg(_REG_CTRL_REG1, 1)[0] >> 4) & 0x07
+        self._odr_hz = _ODR_HZ[self._odr_raw]
+        return self._odr_raw
