@@ -1,45 +1,68 @@
-# адрес на шине I2C, по умолчанию, 0x5D
 import time
-from machine import I2C
+from machine import I2C, Pin
 from sensor_pack_2.bus_service import I2cAdapter
-from lps3xmod import LPS3xST, lps3x_measured_values
+from sensor_pack_2.bmp_common import SensorMode
+from lps3xmod import Lps33
 
-def show_data(values: lps3x_measured_values):
-    print(f"Ambient air temperature [\u2103]: {values.temperature}; Ambient air pressure [hPa]: {values.pressure}")
+I2C_ID = 1
+SCL_PIN = 7
+SDA_PIN = 6
+I2C_FREQ = 400_000
+SENSOR_ADDR = 0x5D
+ITERATIONS = 33
+
+
+def print_sensor_data(t_c: float, p_pa: float) -> None:
+    """Вывод температуры и давления в привычных единицах."""
+    print(f"T={t_c:.2f}°C, P={p_pa:.2f} Pa")
+
 
 if __name__ == '__main__':
-    i2c = I2C(id=1, freq=400_000)  # on Arduino Nano RP2040 Connect tested
+    # Инициализация шины
+    i2c = I2C(id=I2C_ID, scl=Pin(SCL_PIN), sda=Pin(SDA_PIN), freq=I2C_FREQ)
     adapter = I2cAdapter(i2c)
-    pressure_sensor = LPS3xST(adapter=adapter, address=0x5D)
-    #
-    print("LPS3x demo...")
-    print(f"ID: 0x{pressure_sensor.get_id():X}")
-    ds = pressure_sensor.get_data_status()
-    print(f"Data status: {ds}")
-    if ds.TempAvailable:
-        print(f"Ambient air temperature [\u2103]: {pressure_sensor.get_measurement_value(0)}")
-    # print(f"Ambient air pressure [hPa]: {pressure_sensor.get_measurement_value(1)}")
 
-    _meas_vals = None
-    single_shot_wait_time = 1000
-    wait_func = time.sleep_ms
-    repeat_cnt = 50
-    print("\nРежим измерения по запросу (однократный)!")
-    for i in range(repeat_cnt):
-        pressure_sensor.start_measurement(continuous_mode=False, raw_odr=0)
-        wait_func(single_shot_wait_time)
-        ds = pressure_sensor.get_data_status()
-        if ds.TempAvailable and ds.PressAvailable:
-            _meas_vals = pressure_sensor.get_measurement_value(3)
-        show_data(_meas_vals)
+    print("Инициализация LPS33...")
+    ps = Lps33(adapter=adapter, address=SENSOR_ADDR)
+    print(f"Chip ID: 0x{ps.get_id().chip_id:02X}")
 
-    print("\nРежим измерения периодический (автоматический)!")
-    pressure_sensor.start_measurement(continuous_mode=True, raw_odr=1)
-    delay_time = pressure_sensor.get_conversion_cycle_time()
-    print(f"delay time [ms]: {delay_time}")
-    wait_func(delay_time)
-    for cnt, meas_values in enumerate(pressure_sensor):
-        show_data(meas_values)
-        if cnt > repeat_cnt:
+    # Мягкий сброс для гарантии корректного состояния регистров
+    ps.soft_reset()
+    time.sleep_ms(50)
+
+    # РЕЖИМ ОДНОКРАТНЫХ ИЗМЕРЕНИЙ (Forced)
+    print("\nРежим однократных измерений (Forced)")
+    ps.set_power_mode(SensorMode.FORCED)
+    cycle_time = ps.get_conversion_cycle_time()
+
+    for _ in range(ITERATIONS):
+        ps.start_measurement()  # Триггер One-Shot
+        time.sleep_ms(cycle_time + 5)  # жду завершения преобразования + запас
+
+        if ps.is_data_ready():
+            t = ps.get_temperature()
+            p = ps.get_pressure()  # Возвращает Па
+            print_sensor_data(t, p)
+        else:
+            print("Data NOT ready!")
+
+    # РЕЖИМ НЕПРЕРЫВНЫХ ИЗМЕРЕНИЙ (Normal)
+    print("\nРежим непрерывных измерений (Normal)")
+    ps.set_power_mode(SensorMode.NORMAL)
+    ps.set_sampling_period(1)   # 1 Hz
+    ps.start_measurement()  # Коммит настроек в железо
+    cycle_time = ps.get_conversion_cycle_time()
+    print(f"Cycle time: {cycle_time} ms")
+
+    count = 0
+    # Итератор использует метод __next__(), который возвращает MeasuredParams или None
+    for params in ps:
+        if params is None:
+            print("Data NOT ready!")
+        else:
+            print_sensor_data(params.temperature, params.pressure)
+
+        if count >= ITERATIONS:
             break
-        wait_func(delay_time)
+        time.sleep_ms(cycle_time)
+        count += 1
