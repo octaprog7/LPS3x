@@ -1,4 +1,6 @@
 # LPS3x
+## [На русском](README_RU.md)
+
 MicroPython module for working with the LPS3x ambient air pressure sensor from STMicroelectronics.
 
 # Motivation
@@ -26,7 +28,3 @@ Then open main.py in your IDE and run it.
 ![alt text](https://github.com/octaprog7/LPS3x/blob/master/pics/ide_0.png)
 ## Board
 ![alt text](https://github.com/octaprog7/LPS3x/blob/master/pics/board_0.png)
-
-# Warning
-It seems that the store with the letter "A" deceived me. The sensor on the board does not look like LPS3x. LPS3x has a CCLGA-4L case type. 
-I do not know what sensor is on the board!
